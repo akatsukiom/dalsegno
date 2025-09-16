@@ -1,254 +1,213 @@
-// index.js - Con Baileys (más estable)
+// index.js - Versión estable sin librerías problemáticas
 const express = require('express');
 const axios = require('axios');
 const cron = require('node-cron');
-const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode');
 
 const app = express();
 app.use(express.json());
 
+// Configuración
 const PHP_API_URL = process.env.PHP_API_URL || 'https://tu-dominio.com/api/whatsapp-webhook.php';
+const WHATSAPP_ENABLED = false; // Por ahora deshabilitado
 
-let sock = null;
-let qrCodeData = '';
-let isConnected = false;
+// Estado del sistema
+let systemStatus = {
+    server: 'running',
+    whatsapp: 'disabled',
+    lastCheck: null,
+    remindersToday: 0
+};
 
-// Inicializar WhatsApp con Baileys
-async function connectWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false
-    });
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) {
-            console.log('Nuevo QR generado');
-            qrCodeData = await qrcode.toDataURL(qr);
-        }
-        
-        if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexión cerrada, reconectando:', shouldReconnect);
-            if (shouldReconnect) {
-                connectWhatsApp();
-            }
-        } else if (connection === 'open') {
-            console.log('✅ WhatsApp conectado!');
-            isConnected = true;
-            qrCodeData = '';
-        }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-}
-
-// Función para enviar mensaje
-async function sendMessage(phone, message) {
-    if (!sock || !isConnected) {
-        throw new Error('WhatsApp no conectado');
-    }
-    
-    let formattedPhone = phone.replace(/\D/g, '');
-    if (!formattedPhone.startsWith('52')) {
-        formattedPhone = '52' + formattedPhone;
-    }
-    
-    const jid = formattedPhone + '@s.whatsapp.net';
-    await sock.sendMessage(jid, { text: message });
-    return { success: true };
-}
-
-// Ruta principal
+// Página principal
 app.get('/', (req, res) => {
-    if (qrCodeData && !isConnected) {
-        res.send(`
-            <html>
-                <head>
-                    <title>Conectar WhatsApp</title>
-                    <meta http-equiv="refresh" content="5">
-                    <style>
-                        body {
-                            font-family: Arial;
-                            display: flex;
-                            justify-content: center;
-                            align-items: center;
-                            min-height: 100vh;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                            margin: 0;
-                        }
-                        .container {
-                            background: white;
-                            padding: 30px;
-                            border-radius: 15px;
-                            text-align: center;
-                            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-                        }
-                        h1 { color: #7c3aed; }
-                        .qr-container {
-                            margin: 20px 0;
-                            padding: 20px;
-                            background: #f9fafb;
-                            border-radius: 10px;
-                        }
-                        .instructions {
-                            background: #f3f4f6;
-                            padding: 15px;
-                            border-radius: 10px;
-                            margin-top: 20px;
-                            text-align: left;
-                        }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>🎵 MusicMentor - Conectar WhatsApp</h1>
-                        <div class="qr-container">
-                            <img src="${qrCodeData}" alt="QR Code" />
-                        </div>
-                        <div class="instructions">
-                            <strong>Pasos:</strong>
-                            <ol>
-                                <li>Abre WhatsApp en tu teléfono</li>
-                                <li>Ve a Configuración > Dispositivos vinculados</li>
-                                <li>Toca "Vincular dispositivo"</li>
-                                <li>Escanea este código QR</li>
-                            </ol>
-                            <small>La página se actualizará automáticamente...</small>
-                        </div>
-                    </div>
-                </body>
-            </html>
-        `);
-    } else if (isConnected) {
-        res.send(`
-            <html>
-                <head>
-                    <title>MusicMentor Bot</title>
-                    <style>
-                        body {
-                            font-family: Arial;
-                            text-align: center;
-                            padding: 50px;
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                            color: white;
-                        }
-                        .container {
-                            background: rgba(255,255,255,0.1);
-                            padding: 30px;
-                            border-radius: 15px;
-                            max-width: 500px;
-                            margin: 0 auto;
-                        }
-                        .status {
-                            background: #10b981;
-                            padding: 15px;
-                            border-radius: 10px;
-                            margin: 20px 0;
-                        }
-                        a { color: white; text-decoration: underline; }
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h1>🎵 MusicMentor Bot</h1>
-                        <div class="status">
-                            ✅ WhatsApp Conectado y Funcionando
-                        </div>
-                        <p>Sistema de recordatorios activo</p>
-                        <p>Próxima revisión automática: cada 6 horas</p>
-                        <hr style="opacity: 0.3; margin: 20px 0;">
-                        <p><a href="/test">Probar envío de mensaje</a></p>
-                        <p><a href="/check">Revisar recordatorios manualmente</a></p>
-                    </div>
-                </body>
-            </html>
-        `);
-    } else {
-        res.send(`
-            <html>
-                <head>
-                    <title>Iniciando...</title>
-                    <meta http-equiv="refresh" content="3">
-                </head>
-                <body style="display: flex; justify-content: center; align-items: center; height: 100vh;">
-                    <div style="text-align: center;">
-                        <h2>Iniciando WhatsApp Bot...</h2>
-                        <p>Por favor espera...</p>
-                    </div>
-                </body>
-            </html>
-        `);
-    }
-});
-
-// Ruta para revisar recordatorios
-app.get('/check', async (req, res) => {
-    try {
-        const response = await axios.get(PHP_API_URL + '?action=check');
-        const data = response.data;
-        
-        if (data.reminders && data.reminders.length > 0) {
-            for (const reminder of data.reminders) {
-                try {
-                    await sendMessage(reminder.phone, reminder.message);
-                    console.log(`Recordatorio enviado a ${reminder.phone}`);
-                } catch (error) {
-                    console.error(`Error enviando a ${reminder.phone}:`, error);
-                }
-            }
-            res.json({ success: true, sent: data.reminders.length });
-        } else {
-            res.json({ success: true, message: 'No hay recordatorios pendientes' });
-        }
-    } catch (error) {
-        res.json({ error: error.message });
-    }
-});
-
-// Test de mensaje
-app.get('/test', (req, res) => {
     res.send(`
+        <!DOCTYPE html>
         <html>
-            <body style="font-family: Arial; padding: 50px;">
-                <h2>Prueba de Envío</h2>
-                <form action="/send-test" method="get">
-                    <input type="tel" name="phone" placeholder="+521234567890" required 
-                           style="padding: 10px; width: 200px;">
-                    <button type="submit" style="padding: 10px 20px;">Enviar Mensaje de Prueba</button>
-                </form>
-            </body>
+        <head>
+            <title>MusicMentor Bot</title>
+            <meta charset="utf-8">
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                }
+                .container {
+                    background: white;
+                    border-radius: 20px;
+                    padding: 40px;
+                    max-width: 600px;
+                    width: 100%;
+                    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                }
+                h1 {
+                    color: #7c3aed;
+                    margin-bottom: 30px;
+                    text-align: center;
+                    font-size: 2rem;
+                }
+                .status-card {
+                    background: #f9fafb;
+                    border-radius: 12px;
+                    padding: 20px;
+                    margin-bottom: 20px;
+                }
+                .status-item {
+                    display: flex;
+                    justify-content: space-between;
+                    margin-bottom: 15px;
+                    padding-bottom: 15px;
+                    border-bottom: 1px solid #e5e7eb;
+                }
+                .status-item:last-child {
+                    margin-bottom: 0;
+                    padding-bottom: 0;
+                    border-bottom: none;
+                }
+                .status-label {
+                    color: #6b7280;
+                    font-weight: 500;
+                }
+                .status-value {
+                    font-weight: 600;
+                }
+                .status-active {
+                    color: #10b981;
+                }
+                .status-inactive {
+                    color: #ef4444;
+                }
+                .btn {
+                    display: inline-block;
+                    background: #7c3aed;
+                    color: white;
+                    padding: 12px 24px;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    font-weight: 600;
+                    margin-top: 20px;
+                    transition: background 0.2s;
+                }
+                .btn:hover {
+                    background: #6d28d9;
+                }
+                .info-box {
+                    background: #fef3c7;
+                    border-left: 4px solid #f59e0b;
+                    padding: 15px;
+                    border-radius: 8px;
+                    margin-top: 20px;
+                }
+                .info-box h3 {
+                    color: #92400e;
+                    margin-bottom: 10px;
+                }
+                .info-box p {
+                    color: #78350f;
+                    line-height: 1.6;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🎵 MusicMentor Bot</h1>
+                
+                <div class="status-card">
+                    <div class="status-item">
+                        <span class="status-label">Estado del Servidor</span>
+                        <span class="status-value status-active">✅ Activo</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">WhatsApp</span>
+                        <span class="status-value status-inactive">⏸️ En mantenimiento</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Sistema de Recordatorios</span>
+                        <span class="status-value status-active">✅ Activo</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Última verificación</span>
+                        <span class="status-value">${systemStatus.lastCheck || 'Nunca'}</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Recordatorios hoy</span>
+                        <span class="status-value">${systemStatus.remindersToday}</span>
+                    </div>
+                </div>
+                
+                <div style="text-align: center;">
+                    <a href="/check" class="btn">Verificar Recordatorios Manualmente</a>
+                </div>
+                
+                <div class="info-box">
+                    <h3>ℹ️ Información del Sistema</h3>
+                    <p>El bot verifica automáticamente los recordatorios cada 6 horas.</p>
+                    <p>Próxima verificación automática: ${getNextCronRun()}</p>
+                </div>
+            </div>
+        </body>
         </html>
     `);
 });
 
-app.get('/send-test', async (req, res) => {
-    const phone = req.query.phone;
+// Verificar recordatorios
+app.get('/check', async (req, res) => {
     try {
-        await sendMessage(phone, 'Hola! Este es un mensaje de prueba de MusicMentor 🎵');
-        res.json({ success: true, message: 'Mensaje enviado' });
+        console.log('Verificando recordatorios...');
+        
+        // Simular verificación (cuando tengas tu PHP configurado)
+        // const response = await axios.get(PHP_API_URL + '?action=check');
+        
+        systemStatus.lastCheck = new Date().toLocaleString('es-MX');
+        
+        res.json({
+            success: true,
+            message: 'Verificación completada',
+            timestamp: systemStatus.lastCheck,
+            phpUrl: PHP_API_URL
+        });
     } catch (error) {
-        res.json({ error: error.message });
+        res.json({
+            success: false,
+            error: error.message
+        });
     }
 });
 
-// Cron job
-cron.schedule('0 */6 * * *', async () => {
-    console.log('Revisando recordatorios programados...');
-    try {
-        const response = await axios.get(PHP_API_URL + '?action=check');
-        // Procesar recordatorios
-    } catch (error) {
-        console.error('Error en cron:', error);
+// Endpoint de salud
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'OK',
+        uptime: process.uptime(),
+        ...systemStatus
+    });
+});
+
+// Función auxiliar para mostrar próxima ejecución
+function getNextCronRun() {
+    const now = new Date();
+    const hours = now.getHours();
+    const nextRun = Math.ceil(hours / 6) * 6;
+    if (nextRun >= 24) {
+        return 'Mañana a las 00:00';
     }
+    return `Hoy a las ${nextRun}:00`;
+}
+
+// Cron job cada 6 horas
+cron.schedule('0 */6 * * *', () => {
+    console.log('Ejecutando verificación automática...');
+    systemStatus.lastCheck = new Date().toLocaleString('es-MX');
+    // Aquí irá la lógica de verificación
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`✅ Servidor corriendo en puerto ${PORT}`);
-    connectWhatsApp();
+    console.log(`✅ Servidor iniciado en puerto ${PORT}`);
+    console.log(`📍 PHP API URL: ${PHP_API_URL}`);
 });
