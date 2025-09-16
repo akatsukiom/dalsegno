@@ -1,18 +1,13 @@
 {
-  "name": "musicmentor-whatsapp",
+  "name": "musicmentor-bot",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.19.5",
     "express": "^4.18.2",
     "axios": "^1.6.0",
-    "node-cron": "^3.0.2",
-    "qrcode": "^1.5.1"
-  },
-  "engines": {
-    "node": "18.x"
+    "node-cron": "^3.0.2"
   }
 }
