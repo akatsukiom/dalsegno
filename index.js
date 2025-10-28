@@ -347,23 +347,41 @@ app.get('/status', (req, res) => {
 });
 
 // Enviar mensaje: GET /send?phone=521234...&text=Hola
+// Enviar mensaje: GET /send?phone=524961436947&text=Hola
 app.get('/send', async (req, res) => {
   try {
     if (connectionStatus !== 'conectado') {
       return res.status(503).json({ ok: false, error: 'WhatsApp no conectado' });
     }
-    const phone = (req.query.phone || '').trim();
+
+    // Normaliza número
+    let phone = (req.query.phone || '').replace(/\D/g, ''); // solo dígitos
     const text = (req.query.text || '').toString().slice(0, 4096);
+
     if (!phone || !/^\d{10,15}$/.test(phone)) {
-      return res.status(400).json({ ok: false, error: 'phone inválido. Use 52 + número (sin +).' });
+      return res.status(400).json({ ok: false, error: 'Número inválido. Use 52 + número (sin +).' });
     }
-    const jid = `${phone}@c.us`;
-    await client.sendMessage(jid, text || 'Mensaje de prueba');
-    res.json({ ok: true, to: jid, sent: true });
+
+    // 🇲🇽 Ajuste para México: agregar '1' después del 52 si no está
+    if (phone.startsWith('52') && !phone.startsWith('521')) {
+      phone = '521' + phone.slice(2);
+    }
+
+    // Verificar si existe en WhatsApp
+    const id = await client.getNumberId(phone);
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'El número no está en WhatsApp' });
+    }
+
+    // Enviar usando el formato correcto
+    await client.sendMessage(id._serialized, text || 'Mensaje de prueba');
+
+    res.json({ ok: true, to: id._serialized, sent: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || 'Error enviando' });
   }
 });
+
 
 // Cerrar sesión (borra sesión local y fuerza reconexión)
 app.get('/logout', async (req, res) => {
