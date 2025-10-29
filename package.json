@@ -20,5 +20,7 @@
     "qrcode": "^1.5.4",
     "puppeteer": "^22.15.0",
     "whatsapp-web.js": "^1.25.0"
+      "openai": "^4.58.1"
+
   }
 }
