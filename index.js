@@ -1,11 +1,13 @@
 /**
- * MusicMentor Bot – WhatsApp Web.js para Railway
+ * MusicMentor Bot – WhatsApp Web.js para Railway + IA
  * - QR en pantalla (auto-refresh)
  * - Persistencia LocalAuth (en filesystem del contenedor)
- * - Envío de webhooks a PHP_API_URL
- * - Endpoints: /, /qr.png, /status, /send, /logout, /restart
+ * - Webhooks a PHP_API_URL (si ENABLE_INCOMING_WEBHOOK=true)
+ * - Endpoints: /, /qr.png, /status, /send, /logout, /restart, /health
  * - Reintentos y manejo de desconexión
  * - Keep-alive con cron y healthcheck
+ * - IA: Chat + Transcripción de audios (OpenAI)
+ * - Router de comandos que llama a API PHP (Hostinger)
  */
 
 const express = require('express');
@@ -16,6 +18,14 @@ const qrcode = require('qrcode');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const fs = require('fs');
+const path = require('path');
+
+// =========================
+// IA (OpenAI)
+// =========================
+const OpenAI = require('openai');
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // =========================
 // Config
@@ -23,11 +33,11 @@ const morgan = require('morgan');
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'production';
 
-// URL de tu endpoint PHP (recibe los webhooks entrantes desde este bot)
-const PHP_API_URL =
-  process.env.PHP_API_URL || 'https://tu-dominio.com/api/whatsapp-webhook.php';
+// URL de tu endpoint/base PHP (para comandos y/o webhook)
+const PHP_API_URL = process.env.PHP_API_URL || 'https://tu-dominio.com/api/whatsapp-webhook.php';
+const PHP_BASE = process.env.PHP_BASE || (process.env.PHP_API_URL?.replace(/\/[^/]+$/, '/api') || 'https://tu-dominio.com/api');
 
-// Envia logs de mensajes recibidos al webhook
+// Enviar webhook con todos los mensajes entrantes a tu PHP
 const ENABLE_INCOMING_WEBHOOK = (process.env.ENABLE_INCOMING_WEBHOOK || 'true') === 'true';
 
 // Seguridad básica para endpoints sensibles (opcional)
@@ -36,7 +46,7 @@ const ADMIN_TOKEN = process.env.ADMIN_TOKEN || 'cambia-este-token';
 // Reintentos
 const RECONNECT_DELAY_MS = 6000;
 
-// Control de estado global
+// Estado global
 let client = null;
 let qrString = '';
 let qrPngDataUrl = '';
@@ -51,14 +61,11 @@ app.use(express.json({ limit: '1mb' }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan('combined'));
 
-const limiter = rateLimit({
-  windowMs: 30 * 1000,
-  max: 60
-});
+const limiter = rateLimit({ windowMs: 30 * 1000, max: 60 });
 app.use(limiter);
 
 // =========================
-// Utilidades
+// Helpers
 // =========================
 function assertAdmin(req, res) {
   const token = req.header('x-admin-token') || req.query.token || '';
@@ -78,8 +85,80 @@ function shortStatus() {
   };
 }
 
+// === IA: chat ===
+async function askAI(prompt) {
+  try {
+    const r = await openai.chat.completions.create({
+      model: 'gpt-4o-mini', // puedes usar 'gpt-4o'
+      messages: [
+        { role: 'system', content: 'Eres Memorae, asistente de recordatorios/notas. Responde breve, claro y en español.' },
+        { role: 'user', content: prompt }
+      ]
+    });
+    return r.choices?.[0]?.message?.content?.trim() || 'No tengo respuesta.';
+  } catch (e) {
+    console.error('[AI] Error:', e?.message || e);
+    return 'No pude procesar tu mensaje con IA ahora mismo.';
+  }
+}
+
+// === IA: transcripción de audio (ogg/opus) ===
+async function transcribeOgg(filePath) {
+  try {
+    const resp = await openai.audio.transcriptions.create({
+      file: fs.createReadStream(filePath),
+      model: 'gpt-4o-mini-transcribe' // o 'whisper-1' si prefieres
+    });
+    return (resp.text || '').trim();
+  } catch (e) {
+    console.error('[Transcribe] Error:', e?.message || e);
+    return '';
+  }
+}
+
+// === Router de comandos → tu API PHP (Hostinger) ===
+// Ajusta los paths si tus endpoints se llaman distinto.
+async function handleCommand(wa_id, text) {
+  const lower = (text || '').toLowerCase().trim();
+
+  // guardar <nota>
+  if (lower.startsWith('guardar ')) {
+    const nota = text.slice(8).trim();
+    const { data } = await axios.post(`${PHP_BASE}/reminders-send-now.php`, { wa_id, text: nota }, { timeout: 8000 });
+    return data?.ok ? `Guardé/mandé: ${nota}` : `Error: ${data?.error || 'no se pudo'}`;
+  }
+
+  // recordar <consulta>
+  if (lower.startsWith('recordar ')) {
+    const q = text.slice(9).trim();
+    const { data } = await axios.post(`${PHP_BASE}/reminders-report.php`, { wa_id, query: q }, { timeout: 8000 });
+    if (!data?.items?.length) return 'Sin coincidencias.';
+    return data.items.map(i => `#${i.id} · ${i.text}`).join('\n');
+  }
+
+  // lista
+  if (lower === 'lista') {
+    const { data } = await axios.post(`${PHP_BASE}/reminders-report.php`, { wa_id, limit: 5 }, { timeout: 8000 });
+    if (!data?.items?.length) return 'No tienes notas aún.';
+    return data.items.map(i => `#${i.id} · ${i.text}`).join('\n');
+  }
+
+  // enviar ahora (procesar pendientes)
+  if (lower === 'enviar ahora') {
+    const { data } = await axios.post(`${PHP_BASE}/reminders-due.php`, { wa_id }, { timeout: 12000 });
+    return data?.ok ? 'Procesé pendientes ✅' : `Error: ${data?.error || 'no se pudo'}`;
+  }
+
+  // ayuda
+  if (lower === 'ayuda' || lower === 'help') {
+    return 'Comandos: "guardar <nota>", "recordar <texto>", "lista", "enviar ahora". Si no usas comando, te respondo con IA.';
+  }
+
+  return null; // no era un comando conocido
+}
+
 // =========================
-/** Inicializa el cliente de WhatsApp */
+// Inicializa WhatsApp
 // =========================
 async function initWhatsApp() {
   if (client) {
@@ -96,7 +175,6 @@ async function initWhatsApp() {
     authStrategy: new LocalAuth({ clientId: 'musicmentor' }),
     puppeteer: {
       headless: true,
-      // Con puppeteer instalado como dependencia, trae Chromium adecuado para Railway.
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -107,15 +185,10 @@ async function initWhatsApp() {
         '--disable-gpu',
         '--window-size=1280,720'
       ]
-      // executablePath: se deja en blanco para que puppeteer use su Chromium empaquetado
     },
-    webVersionCache: {
-      // Cachear la web version para evitar cambios repentinos
-      type: 'local'
-    }
+    webVersionCache: { type: 'local' }
   });
 
-  // Eventos
   client.on('qr', async (qr) => {
     try {
       qrString = qr;
@@ -139,40 +212,57 @@ async function initWhatsApp() {
     console.log('[WWebJS] Listo y conectado');
   });
 
-  client.on('authenticated', () => {
-    console.log('[WWebJS] Autenticado');
-  });
+  client.on('authenticated', () => console.log('[WWebJS] Autenticado'));
 
   client.on('auth_failure', (m) => {
     connectionStatus = 'error';
     console.error('[WWebJS] Fallo de autenticación:', m);
   });
 
-  client.on('change_state', (state) => {
-    console.log('[WWebJS] Estado:', state);
-  });
+  client.on('change_state', (state) => console.log('[WWebJS] Estado:', state));
 
   client.on('disconnected', (reason) => {
     console.warn('[WWebJS] Desconectado:', reason);
     connectionStatus = 'desconectado';
-    // Reintento controlado
     setTimeout(() => {
       console.log('[WWebJS] Reintentando conexión...');
       initWhatsApp();
     }, RECONNECT_DELAY_MS);
   });
 
+  // =========================
   // Mensajes entrantes
+  // =========================
   client.on('message', async (msg) => {
     try {
-      // Ejemplo simple: ping -> pong
-      if (msg.body && msg.body.trim().toLowerCase() === 'ping') {
-        await client.sendMessage(msg.from, 'pong');
+      const wa_id = msg.from;
+
+      // 1) AUDIO: transcribe y procesa (comando o IA)
+      if (msg.hasMedia && (msg.type === 'ptt' || msg.type === 'audio')) {
+        const media = await msg.downloadMedia();
+        const tmpDir = path.join(__dirname, 'tmp');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+        const oggPath = path.join(tmpDir, `v_${Date.now()}.ogg`);
+        fs.writeFileSync(oggPath, Buffer.from(media.data, 'base64'));
+
+        const texto = await transcribeOgg(oggPath);
+        const reply = (await handleCommand(wa_id, texto)) || (await askAI(texto));
+        await client.sendMessage(msg.from, reply);
+      } else {
+        // 2) TEXTO: comandos → PHP; si no, IA
+        const text = (msg.body || '').trim();
+
+        if (text.toLowerCase() === 'ping') {
+          await client.sendMessage(msg.from, 'pong');
+        } else {
+          const handled = await handleCommand(wa_id, text);
+          await client.sendMessage(msg.from, handled || (await askAI(text)));
+        }
       }
 
+      // 3) (Opcional) enviar webhook a tu PHP como ya hacías
       if (ENABLE_INCOMING_WEBHOOK && PHP_API_URL) {
-        // Enviar webhook a tu API PHP
-        await axios.post(
+        axios.post(
           PHP_API_URL,
           {
             from: msg.from,
@@ -190,12 +280,12 @@ async function initWhatsApp() {
       }
     } catch (err) {
       console.error('[message] Error manejando mensaje:', err?.message || err);
+      try { await client.sendMessage(msg.from, 'Ocurrió un error al procesar tu mensaje 🙏'); } catch {}
     }
   });
 
-  // Media entrante (si necesitas descargar, aquí puedes hacerlo)
-  client.on('message_create', async (msg) => {
-    // placeholder para lógica adicional de mensajes salientes/entrantes propios
+  client.on('message_create', async (_msg) => {
+    // placeholder para lógica de mensajes salientes/entrantes propios si la necesitas
   });
 
   try {
@@ -203,7 +293,6 @@ async function initWhatsApp() {
   } catch (err) {
     console.error('[WWebJS] Error al inicializar:', err?.message || err);
     connectionStatus = 'error';
-    // Reintentar luego de un pequeño delay
     setTimeout(initWhatsApp, RECONNECT_DELAY_MS);
   }
 }
@@ -211,8 +300,6 @@ async function initWhatsApp() {
 // =========================
 // Rutas HTTP
 // =========================
-
-// Página principal (muestra QR o estado)
 app.get('/', (req, res) => {
   const isReady = connectionStatus === 'conectado';
   const autoRefresh = !isReady ? '<meta http-equiv="refresh" content="5">' : '';
@@ -234,18 +321,9 @@ app.get('/', (req, res) => {
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica Neue, Arial;
       background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
       min-height: 100vh;
-      display: grid;
-      place-items: center;
-      padding: 24px;
+      display: grid; place-items: center; padding: 24px;
     }
-    .card {
-      width: 100%;
-      max-width: 760px;
-      background: #fff;
-      border-radius: 16px;
-      box-shadow: 0 20px 60px rgba(0,0,0,.15);
-      padding: 28px;
-    }
+    .card { width: 100%; max-width: 760px; background: #fff; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,.15); padding: 28px; }
     h1 { margin: 0 0 12px; color: #111827; font-weight: 800; }
     .muted { color: #6b7280; margin: 0 0 16px; }
     .status { padding: 10px 14px; border-radius: 10px; font-weight: 600; margin: 16px 0; display:inline-block; }
@@ -254,17 +332,9 @@ app.get('/', (req, res) => {
     .err { background:#ef4444; color:#fff; }
     .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .box { background:#f9fafb; border:1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
-    .btn {
-      display:inline-block; background:#7c3aed; color:#fff; text-decoration:none;
-      padding:10px 16px; border-radius:10px; font-weight:600; margin-right:8px;
-    }
+    .btn { display:inline-block; background:#7c3aed; color:#fff; text-decoration:none; padding:10px 16px; border-radius:10px; font-weight:600; margin-right:8px; }
     .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; }
-    input, button {
-      font: inherit;
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid #d1d5db;
-    }
+    input, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #d1d5db; }
     button { background:#111827; color:#fff; border-color:#111827; cursor:pointer; }
     form { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   </style>
@@ -275,9 +345,7 @@ app.get('/', (req, res) => {
     <p class="muted">Conecta tu WhatsApp escaneando el QR y usa los endpoints para enviar mensajes o consultar estado.</p>
 
     <div class="row">
-      <span class="status ${isReady ? 'ok' : connectionStatus === 'error' ? 'err' : 'wait'}">
-        Estado: ${connectionStatus}
-      </span>
+      <span class="status ${isReady ? 'ok' : connectionStatus === 'error' ? 'err' : 'wait'}">Estado: ${connectionStatus}</span>
       <a class="btn" href="/status">Ver /status</a>
       <a class="btn" href="/qr.png">Ver /qr.png</a>
     </div>
@@ -319,12 +387,9 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// QR como imagen PNG (útil si incrustas en otro panel)
+// QR como imagen PNG
 app.get('/qr.png', async (req, res) => {
-  if (!qrString) {
-    res.status(404).send('QR no disponible');
-    return;
-  }
+  if (!qrString) return res.status(404).send('QR no disponible');
   try {
     const png = await qrcode.toBuffer(qrString, { width: 512 });
     res.setHeader('Content-Type', 'image/png');
@@ -336,60 +401,40 @@ app.get('/qr.png', async (req, res) => {
 
 // Estado
 app.get('/status', (req, res) => {
-  res.json({
-    ok: true,
-    ...shortStatus(),
-    env: {
-      NODE_ENV,
-      PORT
-    }
-  });
+  res.json({ ok: true, ...shortStatus(), env: { NODE_ENV, PORT } });
 });
 
 // Enviar mensaje: GET /send?phone=521234...&text=Hola
-// Enviar mensaje: GET /send?phone=524961436947&text=Hola
 app.get('/send', async (req, res) => {
   try {
     if (connectionStatus !== 'conectado') {
       return res.status(503).json({ ok: false, error: 'WhatsApp no conectado' });
     }
-
-    // Normaliza número
-    let phone = (req.query.phone || '').replace(/\D/g, ''); // solo dígitos
+    let phone = (req.query.phone || '').replace(/\D/g, '');
     const text = (req.query.text || '').toString().slice(0, 4096);
 
     if (!phone || !/^\d{10,15}$/.test(phone)) {
       return res.status(400).json({ ok: false, error: 'Número inválido. Use 52 + número (sin +).' });
     }
-
-    // 🇲🇽 Ajuste para México: agregar '1' después del 52 si no está
     if (phone.startsWith('52') && !phone.startsWith('521')) {
-      phone = '521' + phone.slice(2);
+      phone = '521' + phone.slice(2); // 🇲🇽 MX
     }
 
-    // Verificar si existe en WhatsApp
     const id = await client.getNumberId(phone);
-    if (!id) {
-      return res.status(400).json({ ok: false, error: 'El número no está en WhatsApp' });
-    }
+    if (!id) return res.status(400).json({ ok: false, error: 'El número no está en WhatsApp' });
 
-    // Enviar usando el formato correcto
     await client.sendMessage(id._serialized, text || 'Mensaje de prueba');
-
     res.json({ ok: true, to: id._serialized, sent: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || 'Error enviando' });
   }
 });
 
-
-// Cerrar sesión (borra sesión local y fuerza reconexión)
+// Cerrar sesión
 app.get('/logout', async (req, res) => {
   if (!assertAdmin(req, res)) return;
   try {
-    if (client) {
-      await client.logout();
-    }
+    if (client) await client.logout();
     res.json({ ok: true, message: 'Logout solicitado. Reiniciando...' });
     setTimeout(initWhatsApp, 1500);
   } catch (err) {
@@ -397,7 +442,7 @@ app.get('/logout', async (req, res) => {
   }
 });
 
-// Reiniciar cliente manualmente
+// Reiniciar cliente
 app.get('/restart', async (req, res) => {
   if (!assertAdmin(req, res)) return;
   try {
@@ -408,21 +453,17 @@ app.get('/restart', async (req, res) => {
   }
 });
 
-// Healthcheck (para Railway)
+// Healthcheck
 app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: process.uptime(), ...shortStatus() });
 });
 
-// =========================
-// Keep-alive & mantenimiento
-// =========================
+// Keep-alive
 cron.schedule('*/5 * * * *', async () => {
-  // Ping opcional a tu propia app para mantener instancias vivas
-  // En Railway normalmente no hace falta, pero no estorba.
   console.log('[cron] keep-alive');
 });
 
-// Manejo elegante de señales
+// Señales
 process.on('SIGTERM', async () => {
   console.log('[proc] SIGTERM recibido. Cerrando...');
   try { if (client) await client.destroy(); } catch (_) {}
@@ -434,9 +475,7 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// =========================
-// Inicio del servidor
-// =========================
+// Start
 app.listen(PORT, async () => {
   console.log(`Servidor HTTP en puerto ${PORT}`);
   await initWhatsApp();
