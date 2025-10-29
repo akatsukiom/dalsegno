@@ -1,8 +1,9 @@
 {
-  "name": "musicmentor-bot",
+  "name": "dalsegno-bot",
   "version": "1.0.0",
-  "description": "Bot WhatsApp Web.js para Railway con QR en pantalla, webhooks y mantenimiento",
+  "description": "Bot WhatsApp Web.js para Railway con QR, IA (OpenAI), audios y conexión a API PHP",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js",
     "start:dev": "NODE_ENV=development node index.js"
@@ -17,10 +18,11 @@
     "helmet": "^7.1.0",
     "morgan": "^1.10.0",
     "node-cron": "^3.0.3",
+    "openai": "^4.58.1",
     "qrcode": "^1.5.4",
     "puppeteer": "^22.15.0",
-    "whatsapp-web.js": "^1.25.0"
-      "openai": "^4.58.1"
-
+    "whatsapp-web.js": "^1.25.0",
+    "ioredis": "^5.3.2",
+    "wwebjs-redis": "^1.0.0"
   }
 }
