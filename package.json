@@ -22,8 +22,6 @@
     "qrcode": "^1.5.4",
     "puppeteer": "^22.15.0",
     "whatsapp-web.js": "^1.25.0",
-    "ioredis": "^5.3.2",
-    "@wwebjs/redis": "^1.0.0"
-
+    "ioredis": "^5.3.2"
   }
 }
